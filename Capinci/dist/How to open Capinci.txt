@@ -1,0 +1,42 @@
+CAPINCI 1.0 — CapCut → DaVinci Resolve
+Needs macOS 14 (Sonoma) or later. Works on Apple Silicon and Intel Macs.
+
+INSTALL
+1. Drag Capinci onto the Applications folder in this window.
+2. Open Capinci from Applications.
+
+THE FIRST TIME, MACOS WILL BLOCK IT
+Capinci isn't signed with an Apple developer certificate yet, so macOS says it
+"can't be opened" or "can't verify" it. To allow it once:
+  1. Try to open Capinci, then click Done (or OK).
+  2. Open System Settings → Privacy & Security.
+  3. Scroll down: next to "Capinci was blocked…", click Open Anyway.
+  4. Confirm with your password. From then on it opens normally.
+
+Or, in Terminal:
+  xattr -dr com.apple.quarantine /Applications/Capinci.app
+
+USING IT
+- Your CapCut projects appear on the home screen (from ~/Movies/CapCut).
+- Pick one → NEXT → set the options → CONVERT → choose where to save.
+- In DaVinci Resolve: File → Import → Timeline… → pick the .fcpxml → Ok.
+
+---
+
+CAPINCI 1.0 — CapCut → DaVinci Resolve (français)
+macOS 14 (Sonoma) ou plus récent. Mac Apple Silicon et Intel.
+
+INSTALLER
+1. Glisse Capinci sur le dossier Applications de cette fenêtre.
+2. Ouvre Capinci depuis Applications.
+
+LA PREMIÈRE FOIS, MACOS LA BLOQUE
+Capinci n'est pas encore signée avec un certificat de développeur Apple, donc macOS
+dit qu'elle « ne peut pas être ouverte ». Pour l'autoriser une fois :
+  1. Essaie d'ouvrir Capinci, puis clique sur Terminé (ou OK).
+  2. Ouvre Réglages Système → Confidentialité et sécurité.
+  3. En bas, à côté de « Capinci a été bloquée… », clique sur Ouvrir quand même.
+  4. Confirme avec ton mot de passe. Ensuite elle s'ouvre normalement.
+
+Ou, dans le Terminal :
+  xattr -dr com.apple.quarantine /Applications/Capinci.app

@@ -1,0 +1,12 @@
+.DS_Store
+
+# build output (the DMG is attached to GitHub releases instead)
+Capinci/build/
+
+# personal: mockups made from my own CapCut covers, and timelines with my file paths
+design/
+out/
+
+# not for publication
+Capinci/attic/
+Capinci/SELLING_POINTS.md
