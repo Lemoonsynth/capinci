@@ -390,16 +390,37 @@ public final class Converter {
 
     private typealias Lookup = [String: (kind: String, item: JSON)]
 
-    /// A converted clip, not yet placed: connected clips carry a lane, storyline clips don't.
+    /// A converted clip, not yet placed. `make` renders it at a given offset, with a
+    /// lane attribute (connected clips) or none (primary storyline), plus any clips
+    /// anchored to it.
     private struct Item {
         var start: Int64
         var end: Int64
-        var xml: (_ laneAttr: String) -> String
+        /// The clip's own time at its first frame (its `start` attribute).
+        var localStart: Int64
+        var make: (_ laneAttr: String, _ offset: Int64, _ anchored: [String]) -> String
         var transition: (name: String, frames: Int64)?
     }
 
-    /// Returns (element xml, marker xml, duration in frames).
-    private func convertDraft(_ draft: JSON, indent: String) -> ([String], [String], Int64) {
+    /// One element of the primary storyline, with what gets anchored to it.
+    private struct Slot {
+        var start: Int64
+        var end: Int64
+        var localStart: Int64
+        var item: Item?          // nil: a gap
+        var anchored: [String] = []
+        var transition: (name: String, frames: Int64)?
+    }
+
+    /// Converts one draft (the project, or a compound clip's sub-draft) into the
+    /// children of its primary <spine>, and its duration in frames.
+    ///
+    /// The first video track becomes the primary storyline, so its transitions are
+    /// real Resolve transitions; every other track is connected to it. (FCPXML
+    /// "secondary storylines" would carry transitions on other tracks too, but
+    /// Resolve imports them as one compound clip whose audio collides with the
+    /// audio tracks, and it trims that audio.)
+    private func convertDraft(_ draft: JSON, indent: String) -> (String, Int64) {
         let materials = draft.obj("materials") ?? [:]
         var byId: Lookup = [:]
         for (kind, items) in materials {
@@ -408,14 +429,19 @@ public final class Converter {
             }
         }
 
-        var elements: [String] = []
-        var markers: [(Int64, String)] = []
-        var videoLane = 0, audioLane = 0
         let tracks = draft.objects("tracks")
-        for track in tracks {
+        let mainTrack = tracks.firstIndex { $0.str("type") == "video" }
+        var mainItems: [Item] = []
+        var connected: [(item: Item, lane: Int)] = []
+        var markers: [(frame: Int64, name: String)] = []
+        var videoLane = 0, audioLane = 0
+
+        for (index, track) in tracks.enumerated() {
             let kind = track.str("type") ?? ""
             var lane: Int?
-            if kind == "audio" {
+            if index == mainTrack {
+                lane = 0
+            } else if kind == "audio" {
                 audioLane -= 1
                 lane = audioLane
             } else if ["video", "text", "sticker"].contains(kind) {
@@ -423,7 +449,6 @@ public final class Converter {
                 lane = videoLane
             }  // effect / filter / adjust tracks become markers
 
-            var items: [Item] = []
             let segments = track.objects("segments").sorted {
                 ($0.obj("target_timerange")?.num("start") ?? 0) < ($1.obj("target_timerange")?.num("start") ?? 0)
             }
@@ -440,13 +465,12 @@ public final class Converter {
                     if refKind == "transitions" {
                         let name = refItem.text("name") ?? "CapCut"
                         let length = frames(refItem.num("duration") ?? 0)
-                        if item != nil, kind != "audio", length > 0 {
+                        if item != nil, index == mainTrack, length > 0 {
                             item!.transition = (name, length)
                         } else {
-                            drop("transition")
+                            drop(index == mainTrack ? "transition" : "transition on an upper track")
                             let tr = seg.obj("target_timerange") ?? [:]
-                            markers.append(marker((tr.num("start") ?? 0) + (tr.num("duration") ?? 0),
-                                                  "Transition: \(name)", indent))
+                            markers.append(marker((tr.num("start") ?? 0) + (tr.num("duration") ?? 0), "Transition: \(name)"))
                         }
                     } else if refKind == "material_animations", !refItem.list("animations").isEmpty {
                         drop("in/out animation")
@@ -457,20 +481,14 @@ public final class Converter {
                         drop("mask")
                     }
                 }
-                if let item { items.append(item) }
-            }
-
-            if items.contains(where: { $0.transition != nil }), let lane {
-                elements.append(storyline(items, lane: lane, indent: indent, markers: &markers))
-            } else {
-                elements += items.map { $0.xml(lane.map { " lane=\"\($0)\"" } ?? "") }
+                guard let item, let lane else { continue }
+                if index == mainTrack { mainItems.append(item) } else { connected.append((item, lane)) }
             }
         }
 
         for markSet in materials.objects("time_marks") {
             for item in markSet.objects("mark_items") {
-                let start = item.obj("time_range")?.num("start") ?? 0
-                markers.append(marker(start, item.text("title") ?? "Marker", indent))
+                markers.append(marker(item.obj("time_range")?.num("start") ?? 0, item.text("title") ?? "Marker"))
             }
         }
 
@@ -482,43 +500,58 @@ public final class Converter {
             }
         }
         duration = max(duration, 1)
-        return (elements, markers.filter { $0.0 < duration }.map(\.1), duration)
-    }
 
-    /// A track with transitions becomes a connected storyline: FCPXML only allows
-    /// transitions between elements of a spine. Clips keep their timing; each
-    /// transition is centred on the cut, as in CapCut.
-    private func storyline(_ items: [Item], lane: Int, indent: String, markers: inout [(Int64, String)]) -> String {
-        var children: [String] = []
+        // The primary storyline: main-track clips, with gaps wherever it's empty.
+        var slots: [Slot] = []
+        var cursor: Int64 = 0
+        for item in mainItems where item.end > cursor {
+            if item.start > cursor { slots.append(Slot(start: cursor, end: item.start, localStart: 0)) }
+            slots.append(Slot(start: max(item.start, cursor), end: item.end, localStart: item.localStart,
+                              item: item, transition: item.transition))
+            cursor = item.end
+        }
+        if let last = slots.last, let (_, length) = last.transition, last.end >= duration {
+            // a fade at the very end needs something to fade into
+            duration = last.end + (length + 1) / 2
+        }
+        if cursor < duration { slots.append(Slot(start: cursor, end: duration, localStart: 0)) }
+
+        // Anchor everything else to the storyline element under its first frame.
+        func slotIndex(_ frame: Int64) -> Int {
+            slots.lastIndex { $0.start <= frame } ?? 0
+        }
         let inner = indent + "  "
-        for (i, item) in items.enumerated() {
-            children.append(item.xml("").replacingOccurrences(of: "\n\(indent)", with: "\n\(inner)")
-                .replacingOccurrences(of: "^\(indent)", with: inner, options: .regularExpression))
-            let next = i + 1 < items.count ? items[i + 1] : nil
-            let gapEnd = next?.start ?? item.end
-            var transitionXML: String?
-            if let (name, length) = item.transition {
+        for (item, lane) in connected {
+            let i = slotIndex(item.start)
+            let offset = slots[i].localStart + (item.start - slots[i].start)
+            slots[i].anchored.append(item.make(" lane=\"\(lane)\"", offset, []).indented(by: "  "))
+        }
+        for m in markers where m.frame < duration {
+            let i = slotIndex(m.frame)
+            let start = slots[i].localStart + (m.frame - slots[i].start)
+            slots[i].anchored.append("\(inner)<marker start=\"\(t(start))\" duration=\"\(fd.seconds)\" value=\(quoteAttr(m.name))/>")
+        }
+
+        var children: [String] = []
+        for (i, slot) in slots.enumerated() {
+            if let item = slot.item {
+                children.append(item.make("", slot.start, slot.anchored))
+            } else {
+                let head = "\(indent)<gap name=\"Gap\" offset=\"\(t(slot.start))\" start=\"0s\" duration=\"\(t(slot.end - slot.start))\""
+                children.append(slot.anchored.isEmpty ? "\(head)/>"
+                                : "\(head)>\n" + slot.anchored.joined(separator: "\n") + "\n\(indent)</gap>")
+            }
+            if let (name, length) = slot.transition, i + 1 < slots.count {
                 let (fxName, uid, exact) = Converter.transitionEffect(for: name)
-                if !exact {
-                    drop("transition replaced by Cross Dissolve")
-                    markers.append(marker(Double(item.end) * fd.double * US, "Transition: \(name) → Cross Dissolve", indent))
-                }
+                if !exact { drop("transition replaced by Cross Dissolve") }
                 let ref = effect(fxName, uid: uid)
                 report.transitions += 1
-                transitionXML = "\(inner)<transition name=\(quoteAttr(fxName)) offset=\"\(t(item.end - length / 2))\" "
-                    + "duration=\"\(t(length))\">\n\(inner)  <filter-video ref=\"\(ref)\" name=\(quoteAttr(fxName))/>\n"
-                    + "\(inner)</transition>"
-            }
-            let needsGap = gapEnd > item.end || (transitionXML != nil && next == nil)
-            if let transitionXML { children.append(transitionXML) }
-            if needsGap {
-                // a fade at the end of the track needs something to fade into
-                let end = max(gapEnd, item.end + (item.transition.map { ($0.frames + 1) / 2 } ?? 0))
-                children.append("\(inner)<gap name=\"Gap\" offset=\"\(t(item.end))\" start=\"0s\" duration=\"\(t(end - item.end))\"/>")
+                children.append("\(indent)<transition name=\(quoteAttr(fxName)) offset=\"\(t(slot.end - length / 2))\" "
+                                + "duration=\"\(t(length))\">\n\(inner)<filter-video ref=\"\(ref)\" name=\(quoteAttr(fxName))/>\n"
+                                + "\(indent)</transition>")
             }
         }
-        let first = items.first?.start ?? 0
-        return "\(indent)<spine lane=\"\(lane)\" offset=\"\(t(first))\">\n" + children.joined(separator: "\n") + "\n\(indent)</spine>"
+        return (children.joined(separator: "\n"), duration)
     }
 
     /// Resolve maps FCPXML transitions by name; anything CapCut-specific becomes a Cross Dissolve.
@@ -532,15 +565,14 @@ public final class Converter {
         }
     }
 
-    private func marker(_ startUs: Double, _ name: String, _ indent: String) -> (Int64, String) {
+    private func marker(_ startUs: Double, _ name: String) -> (frame: Int64, name: String) {
         report.markers += 1
-        let f = frames(startUs)
-        return (f, "\(indent)<marker start=\"\(t(f))\" duration=\"\(fd.seconds)\" value=\(quoteAttr(name))/>")
+        return (frames(startUs), name)
     }
 
     private enum Output {
         case clip(Item)
-        case marker((Int64, String))
+        case marker((frame: Int64, name: String))
     }
 
     private func firstRef(_ seg: JSON, _ byId: Lookup, kind: String, where test: (JSON) -> Bool = { _ in true }) -> JSON? {
@@ -562,7 +594,7 @@ public final class Converter {
         guard lane != nil, let (matKind, mat) = found else {
             let name = found?.item.text("name") ?? found?.item.text("type") ?? kind
             drop("\(kind) track item")
-            return .marker(marker(trStart, "\(kind.prefix(1).uppercased())\(kind.dropFirst().lowercased()): \(name)", indent))
+            return .marker(marker(trStart, "\(kind.prefix(1).uppercased())\(kind.dropFirst().lowercased()): \(name)"))
         }
 
         if matKind == "texts" || matKind == "text_templates" {
@@ -571,7 +603,7 @@ public final class Converter {
         }
         if matKind != "videos" && matKind != "audios" {
             drop("\(matKind) item")
-            return .marker(marker(trStart, "\(matKind): \(mat.text("name") ?? "")", indent))
+            return .marker(marker(trStart, "\(matKind): \(mat.text("name") ?? "")"))
         }
 
         var enabled = seg.flag("visible", default: true) ? "" : " enabled=\"0\""
@@ -638,12 +670,11 @@ public final class Converter {
         let name = mat.text("material_name") ?? mat.text("name") ?? "Clip"
         report.clips += 1
         let body = children.joined(separator: "\n")
-        let head = { (laneAttr: String) in
-            "\(indent)<\(tag) ref=\"\(ref)\"\(laneAttr) offset=\"\(self.t(startF))\" "
+        return .clip(Item(start: startF, end: endF, localStart: localStart, make: { lane, offset, anchored in
+            let head = "\(indent)<\(tag) ref=\"\(ref)\"\(lane) offset=\"\(self.t(offset))\" "
                 + "start=\"\(self.t(localStart))\" duration=\"\(self.t(durF))\" name=\(quoteAttr(name))\(enabled)"
-        }
-        return .clip(Item(start: startF, end: endF, xml: { lane in
-            body.isEmpty ? "\(head(lane))/>" : "\(head(lane))>\n\(body)\n\(indent)</\(tag)>"
+            let inside = ([body].filter { !$0.isEmpty } + anchored).joined(separator: "\n")
+            return inside.isEmpty ? "\(head)/>" : "\(head)>\n\(inside)\n\(indent)</\(tag)>"
         }))
     }
 
@@ -843,9 +874,9 @@ public final class Converter {
         let name = String(plain.replacingOccurrences(of: "\n", with: " ").prefix(40))
         let ref = effect("Basic Title", uid: ".../Titles.localized/Bumper:Opener.localized/Basic Title.localized/Basic Title.moti")
         let body = "\(indent)  <text>\(spans.joined())</text>\n" + defs.joined(separator: "\n") + "\n\(transform)\(blend)"
-        return Item(start: startF, end: startF + durF, xml: { lane in
-            "\(indent)<title ref=\"\(ref)\"\(lane) offset=\"\(self.t(startF))\" start=\"0s\" duration=\"\(self.t(durF))\" "
-                + "name=\(quoteAttr(name))\(enabled)>\n\(body)\n\(indent)</title>"
+        return Item(start: startF, end: startF + durF, localStart: 0, make: { lane, offset, anchored in
+            "\(indent)<title ref=\"\(ref)\"\(lane) offset=\"\(self.t(offset))\" start=\"0s\" duration=\"\(self.t(durF))\" "
+                + "name=\(quoteAttr(name))\(enabled)>\n" + ([body] + anchored).joined(separator: "\n") + "\n\(indent)</title>"
         })
     }
 
@@ -1001,17 +1032,14 @@ public final class Converter {
            let data = try? Data(contentsOf: URL(fileURLWithPath: resolvePath(path))) {
             sub = try? JSONSerialization.jsonObject(with: data) as? JSON
         }
-        let (elements, markers, duration) = convertDraft(sub ?? [:], indent: String(repeating: " ", count: 12))
+        let (body, duration) = convertDraft(sub ?? [:], indent: String(repeating: " ", count: 10))
         let rid = newId()
         let mediaName = name ?? compound.text("name") ?? "Compound clip \(report.compoundClips)"
-        let body = (elements + markers).joined(separator: "\n")
         media.append(
             "    <media id=\"\(rid)\" name=\(quoteAttr(mediaName))>\n"
             + "      <sequence format=\"r1\" duration=\"\(t(duration))\" tcStart=\"0s\" tcFormat=\"\(tcFormat)\">\n"
             + "        <spine>\n"
-            + "          <gap name=\"Gap\" offset=\"0s\" start=\"0s\" duration=\"\(t(duration))\">\n"
             + "\(body)\n"
-            + "          </gap>\n"
             + "        </spine>\n"
             + "      </sequence>\n"
             + "    </media>")
@@ -1022,14 +1050,13 @@ public final class Converter {
     // ---- outputs
 
     public func build(name: String) -> String {
-        let (elements, markers, duration) = convertDraft(draft, indent: String(repeating: " ", count: 12))
+        let (body, duration) = convertDraft(draft, indent: String(repeating: " ", count: 12))
         var resources = ["    <format id=\"r1\" name=\"CapCut \(width)x\(height)\" "
                          + "frameDuration=\"\(fd.seconds)\" width=\"\(width)\" height=\"\(height)\""
                          + (colorSpace.map { " colorSpace=\"\($0)\"" } ?? "") + "/>"]
         resources += effectXML
         resources += assetOrder.map { assets[$0]!.xml }
         resources += media
-        let body = (elements + markers).joined(separator: "\n")
         return "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
             + "<!DOCTYPE fcpxml>\n"
             + "<fcpxml version=\"1.9\">\n"
@@ -1039,9 +1066,7 @@ public final class Converter {
             + "      <project name=\(quoteAttr(name))>\n"
             + "        <sequence format=\"r1\" duration=\"\(t(duration))\" tcStart=\"0s\" tcFormat=\"\(tcFormat)\">\n"
             + "          <spine>\n"
-            + "            <gap name=\"Gap\" offset=\"0s\" start=\"0s\" duration=\"\(t(duration))\">\n"
             + "\(body)\n"
-            + "            </gap>\n"
             + "          </spine>\n"
             + "        </sequence>\n"
             + "      </project>\n"

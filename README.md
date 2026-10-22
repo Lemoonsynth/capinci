@@ -16,7 +16,7 @@ compound clips, speed curves, texts, transitions, keyframes and markers come acr
 
 ## Download
 
-Get **Capinci-1.0.dmg** from the [latest release](../../releases/latest).
+Get **Capinci-1.0.1.dmg** from the [latest release](../../releases/latest).
 macOS 14 (Sonoma) or later, Apple Silicon and Intel.
 
 1. Open the DMG and drag **Capinci** onto **Applications**.
