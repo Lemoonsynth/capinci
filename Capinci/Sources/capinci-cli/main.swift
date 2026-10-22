@@ -28,7 +28,9 @@ guard positional.count == 2 else {
 do {
     let dir = URL(fileURLWithPath: positional[0])
     let output = URL(fileURLWithPath: positional[1])
-    let converter = try Converter(projectDir: dir, options: .init(mediaFolder: mediaFolder))
+    let privateFolder = output.deletingLastPathComponent()
+        .appendingPathComponent("\(output.deletingPathExtension().lastPathComponent) Media")
+    let converter = try Converter(projectDir: dir, options: .init(mediaFolder: mediaFolder, privateMediaFolder: privateFolder))
     let xml = converter.build(name: dir.lastPathComponent)
     try converter.copyMedia()
     try xml.write(to: output, atomically: true, encoding: .utf8)
@@ -37,8 +39,8 @@ do {
     }
     let r = converter.report
     print("\(r.clips) clips, \(r.compoundClips) compound, \(r.speedChanges) speed, \(r.speedCurves) curves, "
-          + "\(r.titles) titles (\(r.subtitles) subtitles), \(r.transitions) transitions, \(r.keyframedClips) keyframed, "
-          + "\(r.markers) markers, \(r.missingMedia.count) missing, \(converter.mediaCopies.count) copied")
+          + "\(r.titles) titles (\(r.subtitles) subtitles), \(r.transitions) transitions, \(r.reversed) reversed, \(r.fades) fades, \(r.transitionFades) transition-fades, \(r.blendModes) blend, \(r.colorGrades) graded, \(r.keyframedClips) keyframed, "
+          + "\(r.markers) markers, \(r.missingMedia.count) missing, \(converter.mediaCopies.count) copied (\(r.privateCopied) from CapCut's private folder)")
     for font in r.fonts.sorted(by: { $0.family < $1.family }) {
         print("  font: \(font.family)\(font.installed ? "" : " (not installed)")")
     }

@@ -27,7 +27,13 @@ public enum ConverterError: LocalizedError {
 public struct ConversionOptions {
     /// Copy every media file into this folder (with readable names) and point the timeline at the copies.
     public var mediaFolder: URL?
-    public init(mediaFolder: URL? = nil) { self.mediaFolder = mediaFolder }
+    /// Where to copy media that only CapCut can read (its private ~/Library/Containers folder,
+    /// which macOS keeps other apps such as Resolve out of), when `mediaFolder` is not set.
+    public var privateMediaFolder: URL?
+    public init(mediaFolder: URL? = nil, privateMediaFolder: URL? = nil) {
+        self.mediaFolder = mediaFolder
+        self.privateMediaFolder = privateMediaFolder
+    }
 }
 
 public struct FontUse: Hashable {
@@ -112,6 +118,17 @@ public struct ConversionReport {
     public var subtitles = 0
     public var transitions = 0
     public var keyframedClips = 0
+    public var reversed = 0
+    public var fades = 0
+    /// CapCut's own timeline markers, not transferred.
+    public var capcutMarkers = 0
+    /// Upper-track transitions rebuilt as opacity fades.
+    public var transitionFades = 0
+    /// Media copied out of CapCut's private folder so Resolve can open it.
+    public var privateCopied = 0
+    public var blendModes = 0
+    /// Clips whose CapCut color adjustments went into the CDL file.
+    public var colorGrades = 0
     public var markers = 0
     public var missingMedia: Set<String> = []
     public var fonts: Set<FontUse> = []
@@ -277,11 +294,15 @@ public final class Converter {
     private var media: [String] = []
     private var compoundCache: [String: (id: String, frames: Int64)] = [:]
     private var effects: [String: String] = [:]  // effect name -> resource id
+    /// Fades standing in for transitions on the track being converted, by segment id.
+    private var transitionFades: [String: (in: Int64, out: Int64)] = [:]
     private var effectXML: [String] = []
     private var nextId = 2  // r1 is the sequence format
     private var titleStyles = 0
     private var fontCache: [String: (family: String, face: String)?] = [:]
     private var subtitleCues: [(start: Double, end: Double, text: String)] = []
+    /// Notes raised while converting a clip (time in µs, text), picked up by convertDraft.
+    private var pendingNotes: [(at: Double, text: String)] = []
     /// Media to copy when `options.mediaFolder` is set: source path -> destination.
     public private(set) var mediaCopies: [(source: String, destination: URL)] = []
     private var usedCopyNames: Set<String> = []
@@ -351,8 +372,10 @@ public final class Converter {
         if duration == 0 { duration = 1 }
         let name = material.text("material_name") ?? material.text("name") ?? (path as NSString).lastPathComponent
         var src = path
-        if exists, let folder = options.mediaFolder {
+        let isPrivate = path.contains("/Library/Containers/")
+        if exists, let folder = options.mediaFolder ?? (isPrivate ? options.privateMediaFolder : nil) {
             src = copyDestination(for: path, readableName: name, in: folder).path
+            if isPrivate && options.mediaFolder == nil { report.privateCopied += 1 }
         }
         var attrs = "id=\"\(rid)\" name=\(quoteAttr(name)) start=\"0s\" duration=\"\(t(duration))\""
             + " hasVideo=\"\(isAudio ? 0 : 1)\" hasAudio=\"\(hasAudio ? 1 : 0)\""
@@ -369,7 +392,7 @@ public final class Converter {
     /// the clip's name from CapCut when it has one, keeping the file's extension.
     private func copyDestination(for path: String, readableName: String, in folder: URL) -> URL {
         if let done = mediaCopies.first(where: { $0.source == path }) { return done.destination }
-        let ext = (path as NSString).pathExtension
+        let ext = Self.realExtension(of: path)
         var stem = (readableName as NSString).deletingPathExtension
         stem = stem.components(separatedBy: CharacterSet(charactersIn: "/:\\")).joined(separator: "-")
             .trimmingCharacters(in: .whitespaces)
@@ -384,6 +407,17 @@ public final class Converter {
         let destination = folder.appendingPathComponent(candidate)
         mediaCopies.append((path, destination))
         return destination
+    }
+
+    /// CapCut's sound library saves AAC audio in MP4 containers under an .mp3 name, which
+    /// Resolve can't open; the copy gets the extension that matches what's inside.
+    static func realExtension(of path: String) -> String {
+        let ext = (path as NSString).pathExtension
+        guard ["mp3", "aac", "wav"].contains(ext.lowercased()),
+              let handle = FileHandle(forReadingAtPath: path) else { return ext }
+        defer { try? handle.close() }
+        let head = (try? handle.read(upToCount: 8)) ?? Data()
+        return head.count == 8 && head[4..<8] == Data("ftyp".utf8) ? "m4a" : ext
     }
 
     // ---- per-draft conversion
@@ -452,6 +486,21 @@ public final class Converter {
             let segments = track.objects("segments").sorted {
                 ($0.obj("target_timerange")?.num("start") ?? 0) < ($1.obj("target_timerange")?.num("start") ?? 0)
             }
+            // Transitions only exist on the primary storyline; elsewhere a dissolve-like
+            // transition becomes a fade out of one clip and a fade in of the next.
+            transitionFades = [:]
+            if index != mainTrack, kind == "video" {
+                for (i, seg) in segments.enumerated() {
+                    guard let transition = firstRef(seg, byId, kind: "transitions"),
+                          Converter.isDissolve(transition.text("name")),
+                          let id = seg.str("id") else { continue }
+                    let half = max(frames(transition.num("duration") ?? 0) / 2, 1)
+                    transitionFades[id, default: (0, 0)].out = half
+                    if i + 1 < segments.count, let next = segments[i + 1].str("id") {
+                        transitionFades[next, default: (0, 0)].in = half
+                    }
+                }
+            }
             for seg in segments {
                 var item: Item?
                 switch convertSegment(seg, kind: kind, lane: lane, byId: byId, indent: indent) {
@@ -459,6 +508,8 @@ public final class Converter {
                 case .marker(let m): markers.append(m)
                 case nil: break
                 }
+                markers += pendingNotes.map { marker($0.at, $0.text) }
+                pendingNotes = []
                 // anything attached that we can't reproduce becomes a marker
                 for case let ref as String in seg.list("extra_material_refs") {
                     guard let (refKind, refItem) = byId[ref] else { continue }
@@ -467,16 +518,46 @@ public final class Converter {
                         let length = frames(refItem.num("duration") ?? 0)
                         if item != nil, index == mainTrack, length > 0 {
                             item!.transition = (name, length)
+                        } else if index != mainTrack, kind == "video", Converter.isDissolve(name) {
+                            report.transitionFades += 1  // done as opacity fades, see transitionFades
                         } else {
                             drop(index == mainTrack ? "transition" : "transition on an upper track")
                             let tr = seg.obj("target_timerange") ?? [:]
-                            markers.append(marker((tr.num("start") ?? 0) + (tr.num("duration") ?? 0), "Transition: \(name)"))
+                            let hint = Converter.transitionEquivalent(name).map { " → \($0)" } ?? ""
+                            markers.append(marker((tr.num("start") ?? 0) + (tr.num("duration") ?? 0), "Transition: \(name)\(hint)"))
                         }
                     } else if refKind == "material_animations", !refItem.list("animations").isEmpty {
-                        drop("in/out animation")
+                        // Fade In / Fade Out on video clips become opacity keyframes
+                        let fadesHandled = kind == "video"
+                        let tr = seg.obj("target_timerange") ?? [:]
+                        let start = tr.num("start") ?? 0, length = tr.num("duration") ?? 0
+                        for animation in refItem.objects("animations")
+                        where !(fadesHandled && Converter.fadeKind(animation) != nil) {
+                            drop("in/out animation")
+                            let type = animation.text("type") ?? "anim"
+                            let name = animation.text("name")
+                            // unnamed presets on texts are counted in the report but not marked
+                            if name == nil && kind != "video" { continue }
+                            let at = type == "out" ? start + length - (animation.num("duration") ?? 0) : start
+                            let hint = name.flatMap(Converter.animationEquivalent).map { " → \($0)" } ?? ""
+                            markers.append(marker(at, "Animation \(type)" + (name.map { ": \($0)" } ?? "") + hint))
+                        }
+                    } else if refKind == "audio_effects" {
+                        let name = refItem.text("name") ?? "voice effect"
+                        drop("voice effect")
+                        let tr = seg.obj("target_timerange") ?? [:]
+                        let hint = Converter.voiceEquivalent(name).map { " → \($0)" } ?? ""
+                        markers.append(marker(tr.num("start") ?? 0, "Voice: \(name)\(hint)"))
                     } else if ["effects", "video_effects", "filters"].contains(refKind),
-                              let type = refItem.text("type"), type != "speed" {
+                              let type = refItem.text("type"), type != "speed",
+                              !(type == "mix_mode" && kind == "video" && Converter.blendMode(refItem.text("name")) != nil),
+                              !(kind == "video" && CDL.adjustments.contains(type)) {
                         drop("clip \(refKind.dropLast()) (\(type))")
+                        if refKind == "video_effects", let name = refItem.text("name") {
+                            let tr = seg.obj("target_timerange") ?? [:]
+                            let hint = Converter.videoEffectEquivalent(name).map { " → \($0)" } ?? ""
+                            markers.append(marker(tr.num("start") ?? 0, "Effect: \(name.trimmingCharacters(in: .whitespaces))\(hint)"))
+                        }
                     } else if refKind == "common_mask" || refKind == "masks" {
                         drop("mask")
                     }
@@ -486,10 +567,10 @@ public final class Converter {
             }
         }
 
+        // CapCut's own markers number in the hundreds per project (beat and note marks);
+        // as titles they would bury the timeline, so they are only counted.
         for markSet in materials.objects("time_marks") {
-            for item in markSet.objects("mark_items") {
-                markers.append(marker(item.obj("time_range")?.num("start") ?? 0, item.text("title") ?? "Marker"))
-            }
+            report.capcutMarkers += markSet.objects("mark_items").count
         }
 
         var duration = frames(draft.num("duration") ?? 0)
@@ -516,6 +597,14 @@ public final class Converter {
         }
         if cursor < duration { slots.append(Slot(start: cursor, end: duration, localStart: 0)) }
 
+        // A CapCut transition Resolve can't import becomes a Cross Dissolve; mark the cut
+        // with the closest Resolve transition.
+        for slot in slots.dropLast() {
+            guard let (name, _) = slot.transition, !Converter.transitionEffect(for: name).exact else { continue }
+            let hint = Converter.transitionEquivalent(name).map { " (try \($0))" } ?? ""
+            markers.append(marker(Double(slot.end) * fd.double * US, "Transition: \(name) → Cross Dissolve\(hint)"))
+        }
+
         // Anchor everything else to the storyline element under its first frame.
         func slotIndex(_ frame: Int64) -> Int {
             slots.lastIndex { $0.start <= frame } ?? 0
@@ -526,10 +615,18 @@ public final class Converter {
             let offset = slots[i].localStart + (item.start - slots[i].start)
             slots[i].anchored.append(item.make(" lane=\"\(lane)\"", offset, []).indented(by: "  "))
         }
-        for m in markers where m.frame < duration {
+        // Resolve ignores FCPXML markers (tested in Resolve 21), so every note becomes a
+        // short, disabled title on lanes above the video: readable in the timeline,
+        // never rendered. Notes that overlap stack on extra lanes.
+        let noteLength = max(frames(US), 1)
+        var laneEnds: [Int64] = []
+        for m in markers.sorted(by: { $0.frame < $1.frame }) where m.frame < duration {
+            let end = min(m.frame + noteLength, duration)
+            let row = laneEnds.firstIndex { $0 <= m.frame } ?? laneEnds.count
+            if row == laneEnds.count { laneEnds.append(end) } else { laneEnds[row] = end }
             let i = slotIndex(m.frame)
-            let start = slots[i].localStart + (m.frame - slots[i].start)
-            slots[i].anchored.append("\(inner)<marker start=\"\(t(start))\" duration=\"\(fd.seconds)\" value=\(quoteAttr(m.name))/>")
+            let offset = slots[i].localStart + (m.frame - slots[i].start)
+            slots[i].anchored.append(note(m.name, lane: videoLane + 1 + row, offset: offset, length: end - m.frame, indent: inner))
         }
 
         var children: [String] = []
@@ -565,6 +662,20 @@ public final class Converter {
         }
     }
 
+    /// A disabled title carrying a note ("⚑ TV → Analog Damage").
+    private func note(_ text: String, lane: Int, offset: Int64, length: Int64, indent: String) -> String {
+        let ref = effect("Basic Title", uid: ".../Titles.localized/Bumper:Opener.localized/Basic Title.localized/Basic Title.moti")
+        titleStyles += 1
+        let sid = "ts\(titleStyles)"
+        let label = "⚑ " + text
+        return "\(indent)<title ref=\"\(ref)\" lane=\"\(lane)\" offset=\"\(t(offset))\" start=\"0s\" duration=\"\(t(max(length, 1)))\" "
+            + "name=\(quoteAttr(label)) enabled=\"0\">\n"
+            + "\(indent)  <text><text-style ref=\"\(sid)\">\(xmlEscape(label))</text-style></text>\n"
+            + "\(indent)  <text-style-def id=\"\(sid)\"><text-style font=\"Helvetica\" fontSize=\"40\" "
+            + "fontColor=\"1 0.85 0.2 1\" alignment=\"center\"/></text-style-def>\n"
+            + "\(indent)</title>"
+    }
+
     private func marker(_ startUs: Double, _ name: String) -> (frame: Int64, name: String) {
         report.markers += 1
         return (frames(startUs), name)
@@ -591,19 +702,21 @@ public final class Converter {
         let durF = endF - startF
         if durF <= 0 { return nil }
 
-        guard lane != nil, let (matKind, mat) = found else {
+        guard lane != nil, let (matKind, foundMat) = found else {
             let name = found?.item.text("name") ?? found?.item.text("type") ?? kind
             drop("\(kind) track item")
-            return .marker(marker(trStart, "\(kind.prefix(1).uppercased())\(kind.dropFirst().lowercased()): \(name)"))
+            let clean = name.trimmingCharacters(in: .whitespaces)
+            let hint = kind == "effect" ? Converter.videoEffectEquivalent(clean).map { " → \($0)" } ?? "" : ""
+            return .marker(marker(trStart, "\(kind.prefix(1).uppercased())\(kind.dropFirst().lowercased()): \(clean)\(hint)"))
         }
 
         if matKind == "texts" || matKind == "text_templates" {
-            return title(seg, mat, kind: matKind, byId: byId, startF: startF, durF: durF, trStart: trStart,
+            return title(seg, foundMat, kind: matKind, byId: byId, startF: startF, durF: durF, trStart: trStart,
                          trDuration: trDuration, indent: indent).map(Output.clip)
         }
         if matKind != "videos" && matKind != "audios" {
             drop("\(matKind) item")
-            return .marker(marker(trStart, "\(matKind): \(mat.text("name") ?? "")"))
+            return .marker(marker(trStart, "\(matKind): \(foundMat.text("name") ?? "")"))
         }
 
         var enabled = seg.flag("visible", default: true) ? "" : " enabled=\"0\""
@@ -613,11 +726,25 @@ public final class Converter {
         if abs(speed - 1) < 0.001 { speed = 1.0 }
 
         var compound: JSON?
-        if mat.text("path") == nil {
+        if foundMat.text("path") == nil {
             compound = firstRef(seg, byId, kind: "drafts")
             if compound == nil {
                 drop("media without file")
                 return nil
+            }
+        }
+
+        // CapCut plays a reversed clip from a rendered copy (reverse_path), with the
+        // source range counted in that copy. Use it; if it's gone, reverse in Resolve.
+        var mat = foundMat
+        var reverseInResolve = false
+        if seg.flag("reverse", default: false) {
+            report.reversed += 1
+            if let reversed = mat.text("reverse_path"), FileManager.default.fileExists(atPath: resolvePath(reversed)) {
+                mat["path"] = reversed
+                mat["material_name"] = ((mat.text("material_name") ?? "Clip") as NSString).deletingPathExtension + " (reversed)"
+            } else {
+                reverseInResolve = true
             }
         }
 
@@ -642,7 +769,19 @@ public final class Converter {
         var localStart = frames(srcStart / speed)
         var children: [String] = []
         let curve = firstRef(seg, byId, kind: "speeds") { !(($0.obj("curve_speed") ?? [:]).list("speed_points").isEmpty) }
-        if let curve, let points = curve.obj("curve_speed")?.objects("speed_points") {
+        if reverseInResolve {
+            // local time L shows media D − L·speed: the clip runs backwards at its speed,
+            // and the source range (counted from the end) keeps the usual local start.
+            let total = max(mediaFrames, 1)
+            let endLocal = limitDenominator(Double(total) / speed, 1000)
+            if curve != nil { drop("speed curve on a reversed clip (kept constant)") }
+            children.append(
+                "\(indent)  <timeMap>\n"
+                + "\(indent)    <timept time=\"0s\" value=\"\(t(total))\" interp=\"linear\"/>\n"
+                + "\(indent)    <timept time=\"\(Rational(endLocal.num * fd.num, endLocal.den * fd.den).seconds)\" "
+                + "value=\"0s\" interp=\"linear\"/>\n"
+                + "\(indent)  </timeMap>")
+        } else if let curve, let points = curve.obj("curve_speed")?.objects("speed_points") {
             report.speedCurves += 1
             localStart = frames(srcStart)
             children.append(curveTimeMap(points, srcStart: srcStart, srcDuration: srcDuration,
@@ -659,10 +798,46 @@ public final class Converter {
                 + "\(indent)  </timeMap>")
         }
 
-        let keys = Keyframes(seg, converter: self, localStart: localStart)
+        // CapCut's "Pitch" switch (is_tone_modify) lets the pitch follow the speed.
+        // Resolve ignores FCPXML's preservesPitch (tested in Resolve 21), so only report it.
+        if seg.flag("is_tone_modify", default: false), children.contains(where: { $0.contains("<timeMap") }) {
+            drop("pitch follows speed (set it in Resolve)")
+        }
+
+        var keys = Keyframes(seg, converter: self, localStart: localStart)
+        var blend: String?
+        if matKind == "videos" {
+            keys.alpha = fades(seg, byId, base: keys.alpha, alpha: seg.obj("clip")?.num("alpha") ?? 1, durF: durF)
+            if let mix = firstRef(seg, byId, kind: "effects", where: { $0.str("type") == "mix_mode" }) {
+                blend = Converter.blendMode(mix.text("name"))
+                if blend != nil { report.blendModes += 1 }
+            }
+        }
+        // CapCut's color adjustments become an ASC CDL, which Resolve imports as a
+        // primary grade when "Use color information" is ticked (tested in Resolve 21).
+        // It ignores any saturation in FCPXML, so that one stays a note.
+        if matKind == "videos" {
+            var values: [String: Double] = [:]
+            for case let id as String in seg.list("extra_material_refs") {
+                if let (k, fx) = byId[id], k == "effects", let type = fx.str("type"), CDL.adjustments.contains(type) {
+                    values[type] = fx.num("value") ?? 0
+                }
+            }
+            if let cdl = CDL(capcut: values) {
+                if !cdl.isIdentity {
+                    report.colorGrades += 1
+                    func v(_ c: [Double]) -> String { c.map { fmt($0, 4) }.joined(separator: " ") }
+                    children.append("\(indent)  <info-asc-cdl slope=\"\(v(cdl.slope))\" offset=\"\(v(cdl.offset))\" power=\"\(v(cdl.power))\"/>")
+                }
+                if abs(cdl.saturation - 1) > 0.001 {
+                    drop("saturation (set it in the Color page)")
+                    pendingNotes.append((trStart, "Saturation \(Int((cdl.saturation * 50).rounded())) (Color page, Resolve's default is 50)"))
+                }
+            }
+        }
         if keys.any { report.keyframedClips += 1 }
         keys.unsupported.forEach { drop("keyframes: \($0)") }
-        if let clip = seg.obj("clip"), matKind == "videos" { children += transform(clip, keys, indent) }
+        if let clip = seg.obj("clip"), matKind == "videos" { children += transform(clip, keys, blend: blend, indent) }
         if mat.str("type") != "photo" {
             children += volume(seg, seg.num("volume") ?? 1.0, keys, byId, localStart: localStart, durF: durF, indent)
         }
@@ -740,7 +915,7 @@ public final class Converter {
         "\(fmt(x * (Double(width) / 2) / Double(height) * 100, 4)) \(fmt(y * 50, 4))"
     }
 
-    private func transform(_ clip: JSON, _ keys: Keyframes, _ indent: String) -> [String] {
+    private func transform(_ clip: JSON, _ keys: Keyframes, blend: String? = nil, _ indent: String) -> [String] {
         var out: [String] = []
         let scale = clip.obj("scale") ?? [:]
         let flip = clip.obj("flip") ?? [:]
@@ -769,14 +944,150 @@ public final class Converter {
                        : "\(head)>\n" + params.map { $0.indented(by: "\(indent)    ") }.joined(separator: "\n") + "\n\(indent)  </adjust-transform>")
         }
         let alpha = clip.num("alpha") ?? 1.0
+        let mode = blend.map { " mode=\"\($0)\"" } ?? ""
         if let k = keys.alpha {
-            out.append("\(indent)  <adjust-blend amount=\"\(fmt(alpha, 4))\">\n"
+            out.append("\(indent)  <adjust-blend amount=\"\(fmt(alpha, 4))\"\(mode)>\n"
                        + keys.param("amount", k) { fmt($0[0], 4) }.indented(by: "\(indent)    ")
                        + "\n\(indent)  </adjust-blend>")
-        } else if alpha < 0.999 {
-            out.append("\(indent)  <adjust-blend amount=\"\(fmt(alpha, 4))\"/>")
+        } else if alpha < 0.999 || blend != nil {
+            out.append("\(indent)  <adjust-blend amount=\"\(fmt(alpha, 4))\"\(mode)/>")
         }
         return out
+    }
+
+    /// Fade In / Fade Out animations as opacity keyframes, merged with any CapCut opacity keyframes.
+    private func fades(_ seg: JSON, _ byId: Lookup, base: [Keyframes.Point]?, alpha: Double, durF: Int64) -> [Keyframes.Point]? {
+        var inF: Int64 = 0, outF: Int64 = 0
+        for case let ref as String in seg.list("extra_material_refs") {
+            guard let (kind, item) = byId[ref], kind == "material_animations" else { continue }
+            for animation in item.objects("animations") {
+                let length = min(frames(animation.num("duration") ?? 0), durF)
+                switch Converter.fadeKind(animation) {
+                case "in": inF = length
+                case "out": outF = length
+                default: break
+                }
+            }
+        }
+        if let id = seg.str("id"), let extra = transitionFades[id] {
+            inF = max(inF, min(extra.in, durF / 2))
+            outF = max(outF, min(extra.out, durF / 2))
+        }
+        guard inF > 0 || outF > 0 else { return base }
+        report.fades += 1
+        let points = base ?? []
+        let level = { (f: Int64) -> Double in Keyframes.valueAt(points, f)?[0] ?? alpha }
+        var result: [Keyframes.Point] = []
+        if inF > 0 {
+            result.append(.init(frame: 0, values: [0], smooth: false))
+            result.append(.init(frame: inF, values: [level(inF)], smooth: false))
+        }
+        result += points.filter { $0.frame > inF && $0.frame < durF - outF }
+        if outF > 0 {
+            result.append(.init(frame: max(durF - outF, inF), values: [level(durF - outF)], smooth: false))
+            result.append(.init(frame: durF, values: [0], smooth: false))
+        }
+        return result
+    }
+
+    /// "in" or "out" for CapCut's plain Fade In / Fade Out animations, nil for anything else.
+    static func fadeKind(_ animation: JSON) -> String? {
+        let name = (animation.str("name") ?? "").lowercased()
+        let type = animation.str("type") ?? ""
+        if name == "fade in" && type == "in" { return "in" }
+        if name == "fade out" && type == "out" { return "out" }
+        return nil
+    }
+
+    /// FCPXML blend mode for a CapCut mix mode, in the "index (Name)" form Resolve reads
+    /// (Final Cut's numbering, where the menu separators count: Hard Light is 16).
+    /// Only the modes Resolve imports from FCPXML; others stay a marker.
+    /// CapCut's "Brighten" is Lighten.
+    static func blendMode(_ capcut: String?) -> String? {
+        let modes = [
+            "subtract": "2 (Subtract)", "darken": "3 (Darken)", "multiply": "4 (Multiply)",
+            "add": "8 (Add)", "brighten": "9 (Lighten)", "lighten": "9 (Lighten)", "screen": "10 (Screen)",
+            "overlay": "14 (Overlay)", "soft light": "15 (Soft Light)", "hard light": "16 (Hard Light)",
+            "difference": "22 (Difference)",
+        ]
+        return capcut.flatMap { modes[$0.lowercased()] }
+    }
+
+    /// Transitions that are a plain mix or a dip, which opacity fades can stand in for.
+    static func isDissolve(_ name: String?) -> Bool {
+        ["mix", "dissolve", "cross dissolve", "fade", "black fade", "white fade", "dark flash", "blur"]
+            .contains((name ?? "").lowercased())
+    }
+
+    /// The closest Resolve transition for a CapCut one Resolve can't import (see EQUIVALENCES.md).
+    static func transitionEquivalent(_ capcut: String) -> String? {
+        switch capcut.lowercased() {
+        case "white fade": return "Dip To Color Dissolve (white)"
+        case "blur": return "Blur Dissolve"
+        case "blink": return "Fusion › Brightness Flash"
+        case "light flare": return "Fusion › Glow"
+        case "blanch": return "Fusion › Brightness Flash"
+        case "glitch", "ui glitch": return "Fusion › Glitch"
+        case "channel lag": return "Fusion › RGB Splitter"
+        case "space flip": return "Fusion › Flip 3D"
+        case "rotate & change": return "Fusion › Spin"
+        case "subtle shake", "teleport shake": return "Fusion › Camera Shake"
+        case "pass through 3": return "Fusion › Crash Zoom"
+        case "white smoke": return "Fusion › Noise Dissolve"
+        case "blue snap": return "Fusion › Three Color Flash"
+        default: return nil
+        }
+    }
+
+    /// The closest Resolve FX for a CapCut video effect (see EQUIVALENCES.md).
+    static func videoEffectEquivalent(_ capcut: String) -> String? {
+        let name = capcut.trimmingCharacters(in: .whitespaces).lowercased()
+        switch name {
+        case "blur": return "Gaussian Blur"
+        case "noise", "fuzzy": return "Fast Noise / Film Grain"
+        case "tv", "bad tv", "unstable tv", "faulty signal", "vhs dark", "vhs tape": return "Analog Damage"
+        case "bleached crt", "90s graphic crt": return "Analog Damage + Scanlines"
+        case "lo-fi", "retro dv", "retro dv 3", "jvc": return "Analog Damage + JPEG Damage"
+        case "wide distortion": return "Lens Distortion"
+        case "ripple distortion": return "Warper"
+        case "flash 2", "white flash", "black flash": return "Fusion › Brightness Flash"
+        case "nostalgic light", "halo ii", "angel": return "Glow / Halation"
+        case "star shine": return "Lens Flare"
+        case "glitch", "shaky glitch", "cyber grunge": return "JPEG Damage + Analog Damage + Camera Shake"
+        case "chromatic": return "Prism Blur"
+        case "found footage", "jumpy film": return "Film Damage + Flicker Addition"
+        case "tv off", "tv on": return "animated Zoom + Glow"
+        case "nightvision 2": return "green grade + Film Grain + Vignette"
+        default: return nil
+        }
+    }
+
+    /// The closest way to redo a CapCut in/out animation in Resolve.
+    static func animationEquivalent(_ capcut: String) -> String? {
+        switch capcut.lowercased() {
+        case "rotate": return "Rotation keyframes"
+        case "horizontal blur": return "animated Directional Blur"
+        case "fold", "unfold", "flip up": return "Transform / 3D keyframes"
+        case "wobble 2": return "Camera Shake"
+        case "flicker": return "Flicker Addition"
+        case "glitch": return "JPEG Damage"
+        default: return nil
+        }
+    }
+
+    /// The closest Fairlight FX for a CapCut voice filter, for the marker.
+    static func voiceEquivalent(_ capcut: String) -> String? {
+        switch capcut.lowercased() {
+        case "echo": return "Echo"
+        case "meditation", "live stage", "classroom", "drowned out": return "Reverb"
+        case "deep": return "Pitch (down)"
+        case "sweet", "kiddo", "bianca", "trickster": return "Pitch (up) + Fairlight EQ"
+        case "tube tv", "vintage phone", "intercom", "phonograph", "vinyl": return "Fairlight EQ (band-pass) + Distortion"
+        case "robot", "e·t", "e.t", "vocoda", "glitchy": return "Modulation / Chorus / Pitch"
+        case "memories", "wave", "wispy": return "Reverb + Chorus"
+        case "fuller voice": return "Vocal Channel"
+        default: return nil
+        }
     }
 
     private func decibels(_ volume: Double) -> String {
@@ -1089,8 +1400,9 @@ public final class Converter {
 
     /// Copies the media planned by `options.mediaFolder`, reporting progress from 0 to 1.
     public func copyMedia(progress: (Double) -> Void = { _ in }) throws {
-        guard let folder = options.mediaFolder else { return }
-        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        for folder in Set(mediaCopies.map { $0.destination.deletingLastPathComponent() }) {
+            try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        }
         for (i, copy) in mediaCopies.enumerated() {
             if !FileManager.default.fileExists(atPath: copy.destination.path) {
                 try FileManager.default.copyItem(atPath: copy.source, toPath: copy.destination.path)
@@ -1185,5 +1497,33 @@ struct Keyframes {
 extension String {
     func indented(by prefix: String) -> String {
         split(separator: "\n", omittingEmptySubsequences: false).map { prefix + $0 }.joined(separator: "\n")
+    }
+}
+
+/// An ASC CDL primary grade: out = (in × slope + offset) ^ power, then saturation.
+struct CDL {
+    var slope = [1.0, 1.0, 1.0]
+    var offset = [0.0, 0.0, 0.0]
+    var power = [1.0, 1.0, 1.0]
+    var saturation = 1.0
+
+    var isIdentity: Bool { slope == [1, 1, 1] && offset == [0, 0, 0] && power == [1, 1, 1] }
+
+    /// CapCut adjustments a CDL can approximate; the others (highlights, shadows,
+    /// sharpen, vignette…) stay as notes.
+    static let adjustments: Set<String> = ["brightness", "contrast", "saturation", "temperature", "fade"]
+
+    /// CapCut's sliders run from −1 to 1. The mapping is by eye, not measured:
+    /// brightness lifts everything, contrast pivots around mid-grey (0.435, as Resolve), temperature
+    /// tilts red against blue, fade raises the blacks.
+    init?(capcut values: [String: Double]) {
+        let b = values["brightness"] ?? 0, c = values["contrast"] ?? 0, s = values["saturation"] ?? 0
+        let t = values["temperature"] ?? 0, f = values["fade"] ?? 0
+        guard [b, c, s, t, f].contains(where: { abs($0) > 0.001 }) else { return nil }
+        let k = 1 + 0.5 * c
+        let warm = [1 + 0.15 * t, 1.0, 1 - 0.15 * t]
+        slope = warm.map { $0 * k * (1 - 0.15 * f) }
+        offset = Array(repeating: 0.15 * b + 0.435 * (1 - k) + 0.15 * f, count: 3)
+        saturation = max(0, 1 + s)
     }
 }

@@ -383,14 +383,14 @@ struct ResultPanel: View {
                         Image(systemName: "hourglass")
                         Text(library.progress[project.url]?.stage ?? "Ready. Press CONVERT and choose where to save.")
                     }
-                    Text("Then in Resolve: File → Import → Timeline… → pick the .fcpxml → Ok. Compound clips open with Clip → Open in Timeline.")
+                    Text("Then in Resolve: File → Import → Timeline… → pick the .fcpxml → tick “Use color information” → Ok. Compound clips open with Clip → Open in Timeline.")
                         .font(.system(size: 12.5)).foregroundStyle(Lime.dim)
                         .fixedSize(horizontal: false, vertical: true)
                 }
                 if isHDR {
                     VStack(alignment: .leading, spacing: 4) {
                         Text("HDR PROJECT").font(Lime.mono(11, .bold)).foregroundStyle(Lime.amber)
-                        Text("In Resolve, before importing: Project Settings → Color Management → DaVinci YRGB Color Managed, mode HDR, output HDR PQ. Tick “Use color information” when importing.")
+                        Text("In Resolve, before importing: Project Settings → Color Management → DaVinci YRGB Color Managed, mode HDR, output HDR PQ.")
                             .font(.system(size: 12)).foregroundStyle(Lime.text)
                             .fixedSize(horizontal: false, vertical: true)
                     }
@@ -406,6 +406,8 @@ struct ResultPanel: View {
         if r.speedCurves > 0 { parts.append("\(r.speedCurves) speed curves") }
         if r.speedChanges > 0 { parts.append("\(r.speedChanges) speed changes") }
         if r.transitions > 0 { parts.append("\(r.transitions) transition\(r.transitions == 1 ? "" : "s")") }
+        if r.reversed > 0 { parts.append("\(r.reversed) reversed") }
+        if r.colorGrades > 0 { parts.append("\(r.colorGrades) graded") }
         if r.titles > 0 { parts.append("\(r.titles) texts") }
         if r.keyframedClips > 0 { parts.append("\(r.keyframedClips) animated") }
         if !r.fonts.isEmpty { parts.append("\(r.fonts.count) fonts") }

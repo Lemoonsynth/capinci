@@ -39,6 +39,9 @@ enum DroppedLabel {
         case "text template animation": return "Text template animations"
         case "mask": return "Masks"
         case "media without file": return "Clips without a media file"
+        case "pitch follows speed (set it in Resolve)": return "Clips whose pitch follows the speed in CapCut (set pitch in Resolve)"
+        case "voice effect": return "Voice effects (marked with the closest Fairlight FX)"
+        case "saturation (set it in the Color page)": return "Saturation (marked with the value for the Color page)"
         default: break
         }
         if key.hasPrefix("clip effect (") {

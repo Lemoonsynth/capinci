@@ -180,13 +180,16 @@ struct ConversionResult {
     static func run(project: CapCutProject, output: URL, mediaFolder: URL?, captions: Bool, installFonts: Bool,
                     progress: @escaping @Sendable (Int, Int) -> Void) -> ConversionResult {
         do {
-            let converter = try Converter(projectDir: project.url, options: .init(mediaFolder: mediaFolder))
+            let privateFolder = output.deletingLastPathComponent()
+                .appendingPathComponent("\(output.deletingPathExtension().lastPathComponent) Media")
+            let converter = try Converter(projectDir: project.url,
+                                          options: .init(mediaFolder: mediaFolder, privateMediaFolder: privateFolder))
             let xml = converter.build(name: project.name)
             let total = converter.mediaCopies.count
             try converter.copyMedia { fraction in progress(Int((fraction * Double(total)).rounded()), total) }
             try xml.write(to: output, atomically: true, encoding: .utf8)
             var result = ConversionResult(output: output, report: converter.report,
-                                          mediaFolder: mediaFolder, copiedFiles: total)
+                                          mediaFolder: total > 0 ? (mediaFolder ?? privateFolder) : nil, copiedFiles: total)
             if installFonts {
                 result.installedFonts = Set(FontUse.install(converter.report.fonts.filter { !$0.installed && $0.file != nil }))
             }

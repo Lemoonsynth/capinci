@@ -8,7 +8,7 @@ cd "${0:A:h}"
 
 BUILD=build
 APP=$BUILD/Capinci.app
-VERSION=1.0.1
+VERSION=1.0.2
 mkdir -p $BUILD
 
 # The Command Line Tools ship a stale include/swift/module.modulemap that

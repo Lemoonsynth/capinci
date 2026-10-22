@@ -10,7 +10,7 @@ No dependencies. Its converter is the reference one (`../capcut2davinci.py` is f
    - **Copy media next to the timeline** (off by default): copies the clips into `<name> Media/`
      beside the timeline, with readable names, so the Resolve project no longer depends on CapCut.
    - **Export captions as subtitles (.srt)**: CapCut auto-captions → `.srt` (Resolve: File → Import → Subtitle).
-3. In Resolve: File → Import → Timeline… The app recalls the steps, and the HDR settings when needed.
+3. In Resolve: File → Import → Timeline…, tick **Use color information**. The app recalls the steps, and the HDR settings when needed.
    Fonts CapCut downloaded can be installed from the result card.
 
 ## What converts

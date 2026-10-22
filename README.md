@@ -30,7 +30,8 @@ macOS 14 (Sonoma) or later, Apple Silicon and Intel.
 1. Capinci lists the projects in CapCut's folder (`~/Movies/CapCut/…`) with their covers.
    For a project elsewhere, use **Open folder** or drop its folder on the window.
 2. Pick one → **NEXT** → set the options → **CONVERT** → choose where to save the `.fcpxml`.
-3. In Resolve: **File → Import → Timeline…**, pick the file, keep the defaults, **Ok**.
+3. In Resolve: **File → Import → Timeline…**, pick the file, tick **Use color information**
+   (it brings CapCut's brightness, contrast, temperature and fade), **Ok**.
 
 Options:
 - **Copy media** — copies every clip next to the timeline with readable names, so the
