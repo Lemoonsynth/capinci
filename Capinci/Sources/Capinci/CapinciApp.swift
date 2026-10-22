@@ -4,11 +4,14 @@ import SwiftUI
 @main
 struct CapinciApp: App {
     @State private var library = ProjectLibrary()
+    @State private var updates = UpdateChecker()
 
     var body: some Scene {
         Window("Capinci", id: "main") {
             RootView()
                 .environment(library)
+                .environment(updates)
+                .task { updates.check() }
                 .tint(Lime.purple)
                 .environment(\.locale, Locale(identifier: "en_US"))
                 .preferredColorScheme(.dark)
@@ -17,6 +20,9 @@ struct CapinciApp: App {
         .windowResizability(.contentMinSize)
         .defaultSize(width: 1120, height: 820)
         .commands {
+            CommandGroup(after: .appInfo) {
+                Button("Check for Updates…") { updates.check(manual: true) }
+            }
             CommandGroup(replacing: .newItem) {
                 Button("Open CapCut Project…") { library.openFolder() }
                     .keyboardShortcut("o")

@@ -12,11 +12,12 @@
 
 Capinci is a small Mac app that reads your CapCut desktop projects and writes an FCPXML
 timeline that DaVinci Resolve imports with **File → Import → Timeline…**: cuts, tracks,
-compound clips, speed curves, texts, transitions, keyframes and markers come across.
+compound clips, speed curves, reversed clips, texts, transitions, fades, blend modes,
+keyframes and colour adjustments come across.
 
 ## Download
 
-Get **Capinci-1.0.1.dmg** from the [latest release](../../releases/latest).
+Get the **Capinci DMG** from the [latest release](../../releases/latest).
 macOS 14 (Sonoma) or later, Apple Silicon and Intel.
 
 1. Open the DMG and drag **Capinci** onto **Applications**.
@@ -32,6 +33,9 @@ macOS 14 (Sonoma) or later, Apple Silicon and Intel.
 2. Pick one → **NEXT** → set the options → **CONVERT** → choose where to save the `.fcpxml`.
 3. In Resolve: **File → Import → Timeline…**, pick the file, tick **Use color information**
    (it brings CapCut's brightness, contrast, temperature and fade), **Ok**.
+
+At launch, Capinci asks GitHub whether a newer version is out and, if so, shows a
+**Download** banner (also in the menu: Capinci → Check for Updates…). Nothing else is sent.
 
 Options:
 - **Copy media** — copies every clip next to the timeline with readable names, so the
@@ -49,12 +53,19 @@ Options:
 | Constant speed and **speed curves** | curves keep exact clip length; the ramp inside may differ by a few % |
 | Position, scale, rotation, flip, opacity — and their keyframes | linear and ease interpolation |
 | Volume, volume keyframes, audio fades | fades become volume keyframes |
-| Transitions | Mix → Cross Dissolve, Black Fade → Fade To Color, others → Cross Dissolve + marker |
+| Reversed clips | uses CapCut's rendered reversed copy, or reverses in Resolve |
+| Transitions | Mix → Cross Dissolve, Black Fade → Dip To Color; others → Cross Dissolve + note. On upper tracks, dissolves become opacity fades |
+| Fade in / fade out animations | opacity keyframes |
+| Blend modes | Screen, Multiply, Overlay, Lighten, Darken, Add, Subtract, Soft/Hard Light, Difference |
+| Brightness, contrast, temperature, fade | a primary grade (ASC CDL) in the Color page — tick *Use color information* when importing; matched by eye, close but not pixel-exact |
 | Texts and text templates | font, size, colour per range, bold/italic, outline, shadow, alignment, position, line wrapping |
-| Markers, HDR10 (Rec. 2020 PQ) tagging, drop-frame timecode | |
+| HDR10 (Rec. 2020 PQ) tagging, drop-frame timecode | |
+| Sounds from CapCut's library | copied next to the timeline (Resolve can't read CapCut's private folder) |
 
-Not converted (listed in the app and flagged with markers on the timeline): CapCut effects,
-filters and colour adjustments, masks, in/out and text animations.
+Not converted: CapCut effects and filters, saturation, highlights/shadows, masks, other
+in/out and text animations, voice effects. They are listed in the app and flagged on the
+timeline with disabled **⚑ titles** above the video (Resolve ignores FCPXML markers), each
+naming the closest Resolve tool or the value to set — e.g. “⚑ Effect: TV → Analog Damage”.
 
 ### HDR projects
 Set up the Resolve project **before** importing: Project Settings → Color Management →

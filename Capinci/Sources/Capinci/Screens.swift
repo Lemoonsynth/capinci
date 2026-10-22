@@ -5,6 +5,7 @@ import SwiftUI
 /// or one project's conversion screen.
 struct RootView: View {
     @Environment(ProjectLibrary.self) private var library
+    @Environment(UpdateChecker.self) private var updates
 
     var body: some View {
         ZStack {
@@ -23,6 +24,10 @@ struct RootView: View {
                 }
             }
         }
+        .overlay(alignment: .top) { UpdateBanner().padding(.top, 10) }
+        .animation(.spring(duration: 0.35), value: updates.available?.version)
+        .animation(.spring(duration: 0.35), value: updates.dismissed)
+        .animation(.spring(duration: 0.35), value: updates.upToDate)
         .frame(minWidth: 1000, minHeight: 760)
         .animation(.spring(duration: 0.35), value: library.opened)
         .ignoresSafeArea()

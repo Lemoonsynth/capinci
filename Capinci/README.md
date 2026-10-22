@@ -14,13 +14,19 @@ No dependencies. Its converter is the reference one (`../capcut2davinci.py` is f
    Fonts CapCut downloaded can be installed from the result card.
 
 ## What converts
-Cuts, every track, compound clips, speed changes and speed curves, position/scale/rotation/flip/opacity,
-keyframes on those and on volume (linear or ease), audio fades (as volume keyframes), transitions
-(Mix → Cross Dissolve, Black Fade → Fade To Color, other CapCut transitions → Cross Dissolve + marker),
-styled texts and text templates (font, size, colour per range, bold/italic, outline, shadow, alignment,
-position), markers, HDR (Rec. 2020 PQ) and drop-frame timecode.
-Not converted (flagged with markers / listed in the app): CapCut effects, filters, colour adjustments,
-masks, in/out and text animations.
+Cuts, every track, compound clips, speed changes and speed curves, reversed clips,
+position/scale/rotation/flip/opacity, keyframes on those and on volume (linear or ease), audio fades
+(as volume keyframes), fade in/out animations (as opacity keyframes), transitions (Mix → Cross Dissolve,
+Black Fade → Dip To Color, other CapCut transitions → Cross Dissolve + note; on upper tracks dissolves
+become opacity fades), blend modes, brightness/contrast/temperature/fade (as an ASC CDL grade, imported
+when *Use color information* is ticked), styled texts and text templates (font, size, colour per range,
+bold/italic, outline, shadow, alignment, position), HDR (Rec. 2020 PQ) and drop-frame timecode.
+Sounds in CapCut's private folder are copied next to the timeline.
+Not converted (listed in the app and flagged with disabled "⚑" titles above the video, since Resolve
+ignores FCPXML markers): CapCut effects, filters, saturation, highlights/shadows, masks, other in/out and
+text animations, voice effects.
+
+The app checks GitHub for a newer release at launch (`Updates.swift`) and shows a Download banner.
 
 ## Building
 ```bash
